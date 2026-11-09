@@ -12,8 +12,10 @@ function parseArgs(argv) {
     model: undefined,
     purpose: "general research support",
     timeoutMs: 120000,
+    maxRounds: 6,
     json: false,
     help: false,
+    dryRun: false,
     query: "",
   };
 
@@ -26,6 +28,18 @@ function parseArgs(argv) {
     }
     if (arg === "--json") {
       out.json = true;
+      continue;
+    }
+    if (arg === "--dry-run") {
+      out.dryRun = true;
+      continue;
+    }
+    if (arg === "--max-rounds") {
+      out.maxRounds = clampRounds(Number(argv[++i]));
+      continue;
+    }
+    if (arg.startsWith("--max-rounds=")) {
+      out.maxRounds = clampRounds(Number(arg.slice("--max-rounds=".length)));
       continue;
     }
     if (arg === "--provider") {
@@ -70,14 +84,27 @@ function parseArgs(argv) {
   return out;
 }
 
+function clampRounds(value) {
+  if (!Number.isFinite(value)) return 6;
+  return Math.min(12, Math.max(1, Math.trunc(value)));
+}
+
 function usage() {
   return `Usage:
-  node search.mjs "<query>" [--purpose "<why>"] [--provider openai-codex|anthropic] [--model <id>] [--json]
+  node search.mjs "<query>" [--purpose "<why>"] [--provider openai-codex|anthropic|solid] [--model <id>] [--timeout <ms>] [--max-rounds <n>] [--json] [--dry-run]
+
+Providers:
+  openai-codex   ChatGPT/Codex Responses API with server-side web search
+  anthropic      Anthropic Messages API with server-side web search
+  solid          Solid (OpenAI-compatible) chat completions. Default model is
+                 deepseek/deepseek-v4.1-flash. Solid has no server-side search,
+                 so the script runs a local web_search/web_fetch tool loop.
 
 Examples:
   node search.mjs "latest python release" --purpose "update dependency notes"
   node search.mjs "HTTP/3 browser support 2026" --provider openai-codex
-  node search.mjs "vite 7 breaking changes" --json`;
+  node search.mjs "vite 7 breaking changes" --provider solid --json
+  node search.mjs "rust 2.0 status" --provider solid --dry-run`;
 }
 
 function readJson(path, fallback = {}) {
@@ -124,12 +151,18 @@ function normalizeProvider(provider) {
   if (p.includes("anthropic") || p.includes("claude")) return "anthropic";
   if (p.includes("codex") || p === "openai" || p.startsWith("openai"))
     return "openai-codex";
+  if (p === "solid" || p === "solib" || p === "sol") return "solid";
   return undefined;
 }
 
 function pickProvider(argProvider, settings, auth) {
   const forced = normalizeProvider(argProvider);
   if (forced) return forced;
+
+  // Follow the active Pi session only when it runs on the Solid provider, so
+  // the existing openai-codex/anthropic auto-selection stays unchanged.
+  const fromSession = normalizeProvider(process.env.PI_PROVIDER);
+  if (fromSession === "solid") return "solid";
 
   const fromSettings = normalizeProvider(settings?.defaultProvider);
   if (fromSettings) return fromSettings;
@@ -138,7 +171,7 @@ function pickProvider(argProvider, settings, auth) {
   if (auth?.anthropic) return "anthropic";
 
   throw new Error(
-    "Could not determine provider. Pass --provider openai-codex|anthropic",
+    "Could not determine provider. Pass --provider openai-codex|anthropic|solid",
   );
 }
 
@@ -361,7 +394,10 @@ function pickFastModel(provider, requestedModel, piAi) {
   if (!Array.isArray(models) || models.length === 0) {
     if (requestedModel) return { id: requestedModel, baseUrl: undefined };
     if (provider === "openai-codex")
-      return { id: "gpt-5.4-mini", baseUrl: "https://chatgpt.com/backend-api" };
+      return {
+        id: "gpt-5.6-luna",
+        baseUrl: "https://chatgpt.com/backend-api",
+      };
     return { id: "claude-haiku-4-5", baseUrl: "https://api.anthropic.com" };
   }
 
@@ -373,7 +409,7 @@ function pickFastModel(provider, requestedModel, piAi) {
 
   const preferredIds =
     provider === "openai-codex"
-      ? ["gpt-5.4-mini", "gpt-5.3-codex-spark", "gpt-5.1"]
+      ? ["gpt-5.6-luna", "gpt-5.3-codex-spark", "gpt-5.1"]
       : [
           "claude-haiku-4-5",
           "claude-3-5-haiku-latest",
@@ -690,6 +726,474 @@ async function runAnthropicSearch({
   return text;
 }
 
+const DEFAULT_SOLID_BASE_URL = "https://accounts.solid.xyz/accounts/v1/ai/v1";
+const DEFAULT_SOLID_MODEL = "deepseek/deepseek-v4.1-flash";
+
+function normalizeBaseUrl(baseUrl) {
+  return String(baseUrl || DEFAULT_SOLID_BASE_URL).replace(/\/+$/, "");
+}
+
+function resolveSolidConfig(agentDir) {
+  const candidates = [
+    join(agentDir, "models.json"),
+    join(process.cwd(), ".pi", "models.json"),
+  ];
+
+  let provider;
+  for (const path of candidates) {
+    const config = readJson(path, {});
+    const entry = config?.providers?.solid;
+    if (entry) {
+      provider = entry;
+      break;
+    }
+  }
+
+  const apiKey =
+    resolveConfigValue(provider?.apiKey) ||
+    resolveConfigValue(process.env.SOLID_API_KEY);
+
+  return {
+    baseUrl: normalizeBaseUrl(provider?.baseUrl),
+    apiKey,
+    configured: Boolean(provider),
+  };
+}
+
+function resolveSolidAuthFallback(agentDir) {
+  const auth = readJson(join(agentDir, "auth.json"), {});
+  const entry = auth?.solid;
+  if (!entry) return undefined;
+  const key = resolveConfigValue(entry.key);
+  if (key) return key;
+  return getCachedOAuthAccess(entry)?.apiKey;
+}
+
+const WEB_SEARCH_TOOL = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description:
+      "Search the public web and return ranked results with title, url and snippet.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query" },
+        max_results: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description: "How many results to return (default 6)",
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
+
+const WEB_FETCH_TOOL = {
+  type: "function",
+  function: {
+    name: "web_fetch",
+    description:
+      "Fetch a single public URL and return its readable text (HTML is converted to plain text).",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Absolute https:// URL to fetch" },
+        max_chars: {
+          type: "integer",
+          minimum: 500,
+          maximum: 20000,
+          description: "Maximum characters to return (default 6000)",
+        },
+      },
+      required: ["url"],
+    },
+  },
+};
+
+function decodeHtmlEntities(value) {
+  return String(value)
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16)),
+    )
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*39;|&apos;|&lsquo;|&rsquo;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&mdash;/g, "\u2014")
+    .replace(/&ndash;/g, "\u2013")
+    .replace(/&hellip;/g, "\u2026")
+    .replace(/&amp;/g, "&");
+}
+
+function stripTags(value) {
+  return decodeHtmlEntities(String(value).replace(/<[^>]*>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractHref(attributes) {
+  const match = String(attributes).match(/href\s*=\s*"([^"]*)"/i);
+  return match ? match[1] : undefined;
+}
+
+function decodeDdgUrl(href) {
+  if (!href) return undefined;
+  let value = decodeHtmlEntities(href).trim();
+  if (value.startsWith("//")) value = `https:${value}`;
+  if (/duckduckgo\.com\/l\//i.test(value)) {
+    try {
+      const parsed = new URL(value, "https://duckduckgo.com");
+      const target = parsed.searchParams.get("uddg");
+      if (target) return target;
+    } catch {
+      // fall through
+    }
+  }
+  return /^https?:\/\//i.test(value) ? value : undefined;
+}
+
+function parseDdgResults(html, limit) {
+  const results = [];
+  const blocks = String(html).split(/<div class="result results_links/i).slice(1);
+
+  for (const block of blocks) {
+    const anchor = block.match(
+      /<a\b([^>]*\bclass="result__a"[^>]*)>([\s\S]*?)<\/a>/i,
+    );
+    if (!anchor) continue;
+
+    const url = decodeDdgUrl(extractHref(anchor[1]));
+    const title = stripTags(anchor[2]);
+    if (!url || !title) continue;
+
+    const snippetMatch = block.match(
+      /<a\b[^>]*\bclass="result__snippet"[^>]*>([\s\S]*?)<\/a>/i,
+    );
+    const snippet = snippetMatch ? stripTags(snippetMatch[1]) : "";
+
+    results.push({ title, url, snippet });
+    if (results.length >= limit) break;
+  }
+
+  return results;
+}
+
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+
+async function webSearch(query, maxResults, timeoutMs) {
+  const trimmed = String(query || "").trim();
+  if (!trimmed) throw new Error("web_search requires a non-empty query");
+
+  const limit = Math.min(10, Math.max(1, Math.trunc(maxResults) || 6));
+  const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`;
+  const signal =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+
+  const res = await fetch(endpoint, {
+    headers: { "user-agent": BROWSER_USER_AGENT, accept: "text/html" },
+    signal,
+  });
+
+  if (!res.ok) {
+    throw new Error(`web_search failed (${res.status} ${res.statusText})`);
+  }
+
+  const html = await res.text();
+  const results = parseDdgResults(html, limit);
+  if (results.length === 0) {
+    throw new Error("web_search returned no parseable results");
+  }
+  return results;
+}
+
+function htmlToText(html) {
+  const text = String(html)
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(br|hr)\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|ul|ol|h[1-6]|tr|section|article|header|footer)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  return decodeHtmlEntities(text)
+    .split("\n")
+    .map((line) => line.replace(/[ \t\u00a0]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+async function webFetch(url, maxChars, timeoutMs) {
+  let parsed;
+  try {
+    parsed = new URL(String(url || ""));
+  } catch {
+    throw new Error("web_fetch requires a valid absolute URL");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("web_fetch only supports http(s) URLs");
+  }
+
+  const limit = Math.min(20000, Math.max(500, Math.trunc(maxChars) || 6000));
+  const signal =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+
+  const res = await fetch(parsed.href, {
+    headers: {
+      "user-agent": BROWSER_USER_AGENT,
+      accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+    },
+    redirect: "follow",
+    signal,
+  });
+
+  if (!res.ok) {
+    throw new Error(`web_fetch failed (${res.status} ${res.statusText})`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  const body = await res.text();
+  const text = /html|xml/i.test(contentType) ? htmlToText(body) : body.trim();
+  if (!text) throw new Error("web_fetch returned no readable text");
+  return text.slice(0, limit);
+}
+
+function createDeadline(timeoutMs) {
+  const startedAt = Date.now();
+  return () => {
+    const remaining = timeoutMs - (Date.now() - startedAt);
+    if (remaining <= 0) {
+      throw new Error(`Search timed out after ${timeoutMs}ms`);
+    }
+    return Math.min(remaining, 60000);
+  };
+}
+
+async function callSolidChat({
+  baseUrl,
+  apiKey,
+  model,
+  messages,
+  tools,
+  timeoutMs,
+}) {
+  const signal =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+
+  const body = {
+    model,
+    max_tokens: 2400,
+    temperature: 0,
+    messages,
+  };
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+
+  const res = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/completions`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  const payload = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `Solid request failed (${res.status}): ${payload.slice(0, 1500)}`,
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    throw new Error("Solid returned a non-JSON response");
+  }
+
+  const message = parsed?.choices?.[0]?.message;
+  if (!message) throw new Error("Solid returned no assistant message");
+  return message;
+}
+
+function messageText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
+async function executeSolidToolCall(call, deadline) {
+  let args = {};
+  try {
+    args = JSON.parse(call?.function?.arguments || "{}");
+  } catch {
+    args = {};
+  }
+
+  const name = call?.function?.name;
+  try {
+    if (name === "web_search") {
+      const results = await webSearch(args.query, args.max_results, deadline());
+      return JSON.stringify({ query: args.query, results });
+    }
+    if (name === "web_fetch") {
+      const text = await webFetch(args.url, args.max_chars, deadline());
+      return JSON.stringify({ url: args.url, text });
+    }
+    return JSON.stringify({ error: `Unknown tool: ${String(name)}` });
+  } catch (err) {
+    return JSON.stringify({ error: err?.message || String(err) });
+  }
+}
+
+async function runSolidSearch({
+  model,
+  apiKey,
+  baseUrl,
+  query,
+  purpose,
+  timeoutMs,
+  maxRounds,
+}) {
+  const deadline = createDeadline(timeoutMs);
+  const messages = [
+    { role: "system", content: buildSystemPrompt() },
+    { role: "user", content: buildUserPrompt(query, purpose) },
+  ];
+  const tools = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL];
+  let lastText = "";
+
+  for (let round = 0; round < maxRounds; round++) {
+    const message = await callSolidChat({
+      baseUrl,
+      apiKey,
+      model,
+      messages,
+      tools,
+      timeoutMs: deadline(),
+    });
+
+    const text = messageText(message);
+    if (text) lastText = text;
+
+    const toolCalls = Array.isArray(message.tool_calls)
+      ? message.tool_calls
+      : [];
+
+    if (toolCalls.length === 0) {
+      if (text) return text;
+      break;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: messageText(message) || "",
+      tool_calls: toolCalls,
+    });
+
+    for (const call of toolCalls) {
+      const result = await executeSolidToolCall(call, deadline);
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: result,
+      });
+    }
+  }
+
+  const finalMessage = await callSolidChat({
+    baseUrl,
+    apiKey,
+    model,
+    messages: [
+      ...messages,
+      {
+        role: "user",
+        content:
+          "Return your final concise research summary now, using the search results you gathered. Keep the requested structure and include full canonical https:// URLs.",
+      },
+    ],
+    tools: undefined,
+    timeoutMs: deadline(),
+  });
+
+  const finalText = messageText(finalMessage) || lastText;
+  if (!finalText) {
+    throw new Error("Solid returned an empty response");
+  }
+  return finalText;
+}
+
+function emitResult({ args, provider, model, text }) {
+  if (args.json) {
+    console.log(
+      JSON.stringify(
+        {
+          provider,
+          model,
+          query: args.query,
+          purpose: args.purpose,
+          result: text,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  console.log(`Provider: ${provider}`);
+  console.log(`Model: ${model}`);
+  console.log("");
+  console.log(text);
+}
+
+function emitDryRun({ args, provider, model, baseUrl, credentialFound }) {
+  const info = {
+    provider,
+    model,
+    baseUrl: baseUrl || null,
+    credentialFound,
+    query: args.query,
+    purpose: args.purpose,
+  };
+
+  if (args.json) {
+    console.log(JSON.stringify(info, null, 2));
+    return;
+  }
+
+  console.log(`Provider: ${provider}`);
+  console.log(`Model: ${model}`);
+  if (baseUrl) console.log(`Base URL: ${baseUrl}`);
+  console.log(`Credentials: ${credentialFound ? "found" : "missing"}`);
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || !args.query) {
@@ -704,8 +1208,58 @@ async function main() {
   const settings = readJson(settingsPath, {});
 
   const provider = pickProvider(args.provider, settings, auth);
+
+  if (provider === "solid") {
+    const solid = resolveSolidConfig(agentDir);
+    const apiKey = solid.apiKey || resolveSolidAuthFallback(agentDir);
+    const model = args.model || DEFAULT_SOLID_MODEL;
+
+    if (args.dryRun) {
+      emitDryRun({
+        args,
+        provider,
+        model,
+        baseUrl: solid.baseUrl,
+        credentialFound: Boolean(apiKey),
+      });
+      return;
+    }
+
+    if (!apiKey) {
+      throw new Error(
+        "No API key for provider 'solid'. Add providers.solid.apiKey to " +
+          `${join(agentDir, "models.json")}, add a solid entry to ${authPath}, or set SOLID_API_KEY.`,
+      );
+    }
+
+    const text = await runSolidSearch({
+      model,
+      apiKey,
+      baseUrl: solid.baseUrl,
+      query: args.query,
+      purpose: args.purpose,
+      timeoutMs: args.timeoutMs,
+      maxRounds: args.maxRounds,
+    });
+
+    emitResult({ args, provider, model, text });
+    return;
+  }
+
   const piAi = await loadPiAi();
   const model = pickFastModel(provider, args.model, piAi);
+
+  if (args.dryRun) {
+    emitDryRun({
+      args,
+      provider,
+      model: model.id,
+      baseUrl: model.baseUrl,
+      credentialFound: Boolean(auth?.[provider]),
+    });
+    return;
+  }
+
   const { apiKey, accountId } = await resolveApiKey(
     provider,
     auth,
@@ -732,30 +1286,14 @@ async function main() {
           timeoutMs: args.timeoutMs,
         });
 
-  if (args.json) {
-    console.log(
-      JSON.stringify(
-        {
-          provider,
-          model: model.id,
-          query: args.query,
-          purpose: args.purpose,
-          result: text,
-        },
-        null,
-        2,
-      ),
-    );
-    return;
-  }
-
-  console.log(`Provider: ${provider}`);
-  console.log(`Model: ${model.id}`);
-  console.log("");
-  console.log(text);
+  emitResult({ args, provider, model: model.id, text });
 }
 
 main().catch((err) => {
-  console.error(`Error: ${err?.message || err}`);
+  const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
+  const message = timedOut
+    ? "Search timed out. Increase --timeout and retry."
+    : err?.message || String(err);
+  console.error(`Error: ${message}`);
   process.exit(1);
 });

@@ -36,9 +36,15 @@ npx -y mcporter call 'deepwiki.ask_question(repoName: "owner/repo", question: "H
 
 3. **Cross-check with primary sources**
 
-- Use `web_search`for targeted, version-aware queries
-- Use `fetch_content` for official documentation, changelogs, and Github repositories
+- Use the `native-web-search` skill for targeted, version-aware web queries:
+
+```bash
+node ../native-web-search/search.mjs "<version-aware query>" --purpose "<why you need this>"
+```
+
+- Run it with `--json` (`--provider solid` when the session runs on the Solid provider) to parse results programmatically.
 - Prefer official docs/repo content over secondary blog posts.
+- For official documentation, changelogs, and GitHub repositories, fetch the canonical URL directly (for example with the `web_fetch`/`summarize` tooling) instead of relying on search snippets alone.
 
 4. **Resolve conflicts explicitly**
 
