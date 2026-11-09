@@ -5,7 +5,7 @@ description: "Trigger web search. Use when you need quick internet research with
 
 # Native Web Search
 
-Use this skill to run a **fast model with web search** and get a concise research summary with explicit full URLs.
+Use this skill to run a **fast model with web search** and get a concise research summary with explicit full URLs. Cloud providers use native web search; LM Studio uses a local-model synthesis of fetched search results.
 
 ## Script
 
@@ -25,6 +25,7 @@ Examples:
 node search.mjs "latest python release" --purpose "update dependency notes"
 node search.mjs "vite 7 breaking changes" --purpose "prepare migration checklist"
 node search.mjs "vite 7 breaking changes" --provider solid --json
+node search.mjs "LM Studio tool calling" --provider lmstudio --model qwen.qwen3.8-27b
 ```
 
 Optional flags:
@@ -38,11 +39,13 @@ Optional flags:
 
 ## Providers
 
-| Provider | Default model | Web search |
-| --- | --- | --- |
-| `openai-codex` | fastest available Codex model | server-side `web_search` tool |
-| `anthropic` | fastest available Claude Haiku model | server-side `web_search_20250305` tool |
-| `solid` | `deepseek/deepseek-v4.1-flash` | local `web_search` / `web_fetch` tool loop |
+| Provider       | Default model                        | Web search                                 |
+| -------------- | ------------------------------------ | ------------------------------------------ |
+| `openai-codex` | fastest available Codex model        | server-side `web_search` tool              |
+| `anthropic`    | fastest available Claude Haiku model | server-side `web_search_20250305` tool     |
+| `solid`        | `deepseek/deepseek-v4.1-flash`       | local `web_search` / `web_fetch` tool loop |
+
+For LM Studio, local models cannot independently browse: the script searches DuckDuckGo's HTML results endpoint, then sends the result titles, snippets, and canonical URLs to the configured local model for synthesis.
 
 ### Solid provider
 
@@ -79,7 +82,15 @@ node search.mjs "test" --provider solid --dry-run
 ## Output expectations
 
 The script instructs the model to:
+
 - search the internet for the requested topic
+- `--provider openai-codex|anthropic|lmstudio`
+- `--model <model-id>`
+- `--timeout <ms>`
+- `--json`
+
+The model is instructed to:
+
 - provide a concise summary for the given purpose
 - include full canonical URLs (`https://...`) for each key finding
 - highlight disagreements between sources
@@ -91,3 +102,6 @@ The script instructs the model to:
 - If OAuth helper resolution fails, set `PI_AI_OAUTH_MODULE_PATH` to `@mariozechner/pi-ai`'s `dist/oauth.js` path.
 - For OAuth providers, the script can fall back to a still-valid cached `access` token from `~/.pi/agent/auth.json`.
 - The Solid path does not use `pi-ai` at all.
+- LM Studio is read from the `lmstudio` provider in `~/.pi/agent/models.json` (typically `baseUrl: "http://localhost:1234/v1"`). Its configured API key and headers are used for the local request.
+- When called from Pi, `PI_PROVIDER` and `PI_MODEL` select the active LM Studio model automatically. Otherwise pass `--provider lmstudio` and optionally `--model`.
+- LM Studio searches send the query to DuckDuckGo; the model synthesis stays local.
