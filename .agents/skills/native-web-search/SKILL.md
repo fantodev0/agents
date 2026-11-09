@@ -30,7 +30,7 @@ node search.mjs "LM Studio tool calling" --provider lmstudio --model qwen.qwen3.
 
 Optional flags:
 
-- `--provider openai-codex|anthropic|solid`
+- `--provider openai-codex|anthropic|solid|lmstudio`
 - `--model <model-id>`
 - `--timeout <ms>`
 - `--max-rounds <n>` (Solid only, default `6`)
@@ -39,11 +39,12 @@ Optional flags:
 
 ## Providers
 
-| Provider       | Default model                        | Web search                                 |
-| -------------- | ------------------------------------ | ------------------------------------------ |
-| `openai-codex` | fastest available Codex model        | server-side `web_search` tool              |
-| `anthropic`    | fastest available Claude Haiku model | server-side `web_search_20250305` tool     |
-| `solid`        | `deepseek/deepseek-v4.1-flash`       | local `web_search` / `web_fetch` tool loop |
+| Provider       | Default model                          | Web search                                 |
+| -------------- | -------------------------------------- | ------------------------------------------ |
+| `openai-codex` | fastest available Codex model          | server-side `web_search` tool              |
+| `anthropic`    | fastest available Claude Haiku model   | server-side `web_search_20250305` tool     |
+| `solid`        | `deepseek/deepseek-v4.1-flash`         | local `web_search` / `web_fetch` tool loop |
+| `lmstudio`     | first model in the `lmstudio` provider | local DuckDuckGo search + local synthesis  |
 
 For LM Studio, local models cannot independently browse: the script searches DuckDuckGo's HTML results endpoint, then sends the result titles, snippets, and canonical URLs to the configured local model for synthesis.
 
@@ -62,11 +63,19 @@ runs a tool loop: the model calls `web_search` (DuckDuckGo HTML results) and
 Provider selection order:
 
 1. `--provider`
-2. `PI_PROVIDER=solid` (the active Pi session runs on Solid)
-3. `settings.json` `defaultProvider`
-4. available credentials (`openai-codex`, then `anthropic`)
+2. a provider in `models.json` that declares `--model`
+3. `PI_PROVIDER` (the active Pi session, e.g. `PI_PROVIDER=solid` or `PI_PROVIDER=lmstudio`)
+4. `settings.json` `defaultProvider`
+5. available credentials (`openai-codex`, then `anthropic`)
 
-Credentials resolve in this order:
+Provider-specific resolution:
+
+- `solid` uses `providers.solid` in `models.json` (`baseUrl`, `apiKey`).
+- `lmstudio` uses `providers.lmstudio` in `models.json` (`baseUrl`, `apiKey`,
+  `headers`), falling back to `PI_MODEL` / `settings.json defaultModel` when no
+  `--model` is passed.
+
+Credentials for Solid resolve in this order:
 
 1. `providers.solid.apiKey` in `$PI_CODING_AGENT_DIR/models.json`
    (default `~/.pi/agent/models.json`), then `./.pi/models.json`
@@ -84,13 +93,6 @@ node search.mjs "test" --provider solid --dry-run
 The script instructs the model to:
 
 - search the internet for the requested topic
-- `--provider openai-codex|anthropic|lmstudio`
-- `--model <model-id>`
-- `--timeout <ms>`
-- `--json`
-
-The model is instructed to:
-
 - provide a concise summary for the given purpose
 - include full canonical URLs (`https://...`) for each key finding
 - highlight disagreements between sources

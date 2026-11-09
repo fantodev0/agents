@@ -91,7 +91,7 @@ function clampRounds(value) {
 
 function usage() {
   return `Usage:
-  node search.mjs "<query>" [--purpose "<why>"] [--provider openai-codex|anthropic|solid] [--model <id>] [--timeout <ms>] [--max-rounds <n>] [--json] [--dry-run]
+  node search.mjs "<query>" [--purpose "<why>"] [--provider openai-codex|anthropic|solid|lmstudio] [--model <id>] [--timeout <ms>] [--max-rounds <n>] [--json] [--dry-run]
 
 Providers:
   openai-codex   ChatGPT/Codex Responses API with server-side web search
@@ -99,13 +99,14 @@ Providers:
   solid          Solid (OpenAI-compatible) chat completions. Default model is
                  deepseek/deepseek-v4.1-flash. Solid has no server-side search,
                  so the script runs a local web_search/web_fetch tool loop.
-  node search.mjs "<query>" [--purpose "<why>"] [--provider openai-codex|anthropic|lmstudio] [--model <id>] [--json]
+  lmstudio       LM Studio (OpenAI-compatible) local server. Runs a local
+                 DuckDuckGo search and summarizes the results with the model.
 
 Examples:
   node search.mjs "latest python release" --purpose "update dependency notes"
   node search.mjs "HTTP/3 browser support 2026" --provider openai-codex
   node search.mjs "vite 7 breaking changes" --provider solid --json
-  node search.mjs "rust 2.0 status" --provider solid --dry-run;
+  node search.mjs "rust 2.0 status" --provider solid --dry-run
   node search.mjs "LM Studio tool calling" --provider lmstudio --model qwen.qwen3.8-27b
   node search.mjs "vite 7 breaking changes" --json`;
 }
@@ -1543,7 +1544,13 @@ async function main() {
   const settings = readJson(settingsPath, {});
   const modelsConfig = readJson(modelsPath, {});
 
-  const provider = pickProvider(args.provider, settings, auth);
+  const provider = pickProvider(
+    args.provider,
+    settings,
+    auth,
+    modelsConfig,
+    args.model,
+  );
 
   if (provider === "solid") {
     const solid = resolveSolidConfig(agentDir);
@@ -1582,6 +1589,46 @@ async function main() {
     return;
   }
 
+  if (provider === "lmstudio") {
+    const activeLmStudioModel =
+      normalizeProvider(process.env.PI_PROVIDER) === "lmstudio"
+        ? process.env.PI_MODEL
+        : undefined;
+    const defaultLmStudioModel =
+      normalizeProvider(settings.defaultProvider) === "lmstudio"
+        ? settings.defaultModel
+        : undefined;
+    const lmStudio = resolveLmStudioModel(
+      modelsConfig,
+      args.model || activeLmStudioModel || defaultLmStudioModel,
+    );
+
+    if (args.dryRun) {
+      emitDryRun({
+        args,
+        provider,
+        model: lmStudio.id,
+        baseUrl: lmStudio.baseUrl,
+        credentialFound: Boolean(lmStudio.apiKey),
+      });
+      return;
+    }
+
+    const text = await runLmStudioSearch({
+      model: lmStudio.id,
+      baseUrl: lmStudio.baseUrl,
+      apiKey: lmStudio.apiKey,
+      authHeader: lmStudio.authHeader,
+      headers: lmStudio.headers,
+      query: args.query,
+      purpose: args.purpose,
+      timeoutMs: args.timeoutMs,
+    });
+
+    emitResult({ args, provider, model: lmStudio.id, text });
+    return;
+  }
+
   const piAi = await loadPiAi();
   const model = pickFastModel(provider, args.model, piAi);
 
@@ -1598,69 +1645,29 @@ async function main() {
 
   const { apiKey, accountId } = await resolveApiKey(
     provider,
-  const provider = pickProvider(
-    args.provider,
-    settings,
     auth,
-    modelsConfig,
-    args.model,
+    authPath,
+    piAi,
   );
-  let model;
-  let text;
 
-  if (provider === "lmstudio") {
-    const activeLmStudioModel =
-      normalizeProvider(process.env.PI_PROVIDER) === "lmstudio"
-        ? process.env.PI_MODEL
-        : undefined;
-    const defaultLmStudioModel =
-      normalizeProvider(settings.defaultProvider) === "lmstudio"
-        ? settings.defaultModel
-        : undefined;
-    const lmStudio = resolveLmStudioModel(
-      modelsConfig,
-      args.model || activeLmStudioModel || defaultLmStudioModel,
-    );
-    model = { id: lmStudio.id };
-    text = await runLmStudioSearch({
-      model: model.id,
-      baseUrl: lmStudio.baseUrl,
-      apiKey: lmStudio.apiKey,
-      authHeader: lmStudio.authHeader,
-      headers: lmStudio.headers,
-      query: args.query,
-      purpose: args.purpose,
-      timeoutMs: args.timeoutMs,
-    });
-  } else {
-    const piAi = await loadPiAi();
-    model = pickFastModel(provider, args.model, piAi);
-    const { apiKey, accountId } = await resolveApiKey(
-      provider,
-      auth,
-      authPath,
-      piAi,
-    );
-
-    text =
-      provider === "openai-codex"
-        ? await runCodexSearch({
-            model: model.id,
-            apiKey,
-            accountId,
-            query: args.query,
-            purpose: args.purpose,
-            timeoutMs: args.timeoutMs,
-            baseUrl: model.baseUrl,
-          })
-        : await runAnthropicSearch({
-            model: model.id,
-            apiKey,
-            query: args.query,
-            purpose: args.purpose,
-            timeoutMs: args.timeoutMs,
-          });
-  }
+  const text =
+    provider === "openai-codex"
+      ? await runCodexSearch({
+          model: model.id,
+          apiKey,
+          accountId,
+          query: args.query,
+          purpose: args.purpose,
+          timeoutMs: args.timeoutMs,
+          baseUrl: model.baseUrl,
+        })
+      : await runAnthropicSearch({
+          model: model.id,
+          apiKey,
+          query: args.query,
+          purpose: args.purpose,
+          timeoutMs: args.timeoutMs,
+        });
 
   emitResult({ args, provider, model: model.id, text });
 }
